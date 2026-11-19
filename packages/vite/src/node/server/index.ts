@@ -75,8 +75,9 @@ import {
 } from '../watch'
 import type { ServerWatchOptions } from '../watch'
 import type { DevEnvironment } from './environment'
+import { createFileContentTracker } from './fileContentTracker'
 import type { HmrOptions, NormalizedHotChannel, WsOptions } from './hmr'
-import { handleHMRUpdate, updateModules } from './hmr'
+import { debugHmr, handleHMRUpdate, updateModules } from './hmr'
 import { baseMiddleware } from './middlewares/base'
 import { errorMiddleware } from './middlewares/error'
 import { hostValidationMiddleware } from './middlewares/hostCheck'
@@ -1002,6 +1003,7 @@ function setupWatcherListeners(
 ): void {
   const { watcher } = server
   const { publicDir, server: serverConfig } = server.config
+  const fileContents = createFileContentTracker()
 
   const onHMRUpdate = async (
     type: 'create' | 'delete' | 'update',
@@ -1042,6 +1044,13 @@ function setupWatcherListeners(
       }
     }
     if (isUnlink) {
+      fileContents.forget(file)
+    } else {
+      // Record the new file's bytes so a later save that changes nothing is
+      // recognised as a no-op.
+      await fileContents.remember(file)
+    }
+    if (isUnlink) {
       // invalidate module graph cache on file change
       for (const environment of Object.values(server.environments)) {
         environment.moduleGraph.onFileDelete(file)
@@ -1052,13 +1061,26 @@ function setupWatcherListeners(
 
   const onFileChange = async (file: string) => {
     file = normalizePath(file)
-    reloadOnTsconfigChange(server, file)
+    const contentChanged = await fileContents.hasChanged(file)
+    if (contentChanged) {
+      reloadOnTsconfigChange(server, file)
+    }
 
+    // Plugins still hear about every change event, as before.
     await Promise.all(
       Object.values(server.environments).map((environment) =>
         environment.pluginContainer.watchChange(file, { event: 'update' }),
       ),
     )
+
+    if (!contentChanged) {
+      // Same bytes as last time: the served code can't differ, so skip the
+      // invalidation and the HMR update instead of re-running the module and
+      // its importers for nothing.
+      debugHmr?.(`[file unchanged] ${file}`)
+      return
+    }
+
     // invalidate module graph cache on file change
     for (const environment of Object.values(server.environments)) {
       environment.moduleGraph.onFileChange(file)
